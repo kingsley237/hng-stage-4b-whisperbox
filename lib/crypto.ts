@@ -1,16 +1,19 @@
 const PBKDF2_ITERATIONS = 100000;
 const PBKDF2_HASH = 'SHA-256';
-const AES_KW_LENGTH = 256;
 const AES_GCM_LENGTH = 256;
 const RSA_MODULUS_LENGTH = 2048;
 const RSA_PUBLIC_EXPONENT = new Uint8Array([1, 0, 1]);
 const RSA_HASH = 'SHA-256';
 
-// convert ArrayBuffer to base64 string
-export function bufToB64(buf: ArrayBuffer): string {
-  // always work from a clean copy
-  const clean = buf instanceof ArrayBuffer ? buf : (buf as Uint8Array).buffer;
-  const bytes = new Uint8Array(clean);
+function cleanBuffer(input: ArrayBuffer | Uint8Array): ArrayBuffer {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const clean = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(clean).set(bytes);
+  return clean;
+}
+
+export function bufToB64(buf: ArrayBuffer | Uint8Array): string {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   let binary = '';
   for (let i = 0; i < bytes.byteLength; i++) {
     binary += String.fromCharCode(bytes[i]);
@@ -24,13 +27,9 @@ export function b64ToBuf(b64: string): ArrayBuffer {
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
-  // always return a fresh detached ArrayBuffer
-  const clean = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(clean).set(bytes);
-  return clean;
+  return cleanBuffer(bytes);
 }
 
-// generate a random RSA-OAEP keypair
 export async function generateKeyPair(): Promise<CryptoKeyPair> {
   return crypto.subtle.generateKey(
     {
@@ -39,13 +38,29 @@ export async function generateKeyPair(): Promise<CryptoKeyPair> {
       publicExponent: RSA_PUBLIC_EXPONENT,
       hash: RSA_HASH,
     },
-    true, // extractable — needed to export public key
+    true,
     ['encrypt', 'decrypt']
   );
 }
 
-// derive an AES-KW wrapping key from password + salt via PBKDF2
-export async function deriveWrappingKey(
+export async function exportPublicKey(publicKey: CryptoKey): Promise<string> {
+  const exported = await crypto.subtle.exportKey('spki', publicKey);
+  return bufToB64(exported);
+}
+
+export async function importPublicKey(b64: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'spki',
+    b64ToBuf(b64),
+    { name: 'RSA-OAEP', hash: RSA_HASH },
+    false,
+    ['encrypt']
+  );
+}
+
+// derive AES-GCM key from password + salt via PBKDF2
+// used to encrypt/decrypt the private key
+async function deriveAESKey(
   password: string,
   salt: ArrayBuffer
 ): Promise<CryptoKey> {
@@ -57,78 +72,70 @@ export async function deriveWrappingKey(
     false,
     ['deriveKey']
   );
-
-  // ensure clean buffer
-  const cleanSalt = salt.slice(0);
-
   return crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
-      salt: cleanSalt,
+      salt: cleanBuffer(salt),
       iterations: PBKDF2_ITERATIONS,
       hash: PBKDF2_HASH,
     },
     keyMaterial,
-    { name: 'AES-KW', length: AES_KW_LENGTH },
+    { name: 'AES-GCM', length: AES_GCM_LENGTH },
     false,
-    ['wrapKey', 'unwrapKey']
+    ['encrypt', 'decrypt']
   );
 }
 
-// wrap (encrypt) the RSA private key with AES-KW wrapping key
-export async function wrapPrivateKey(
+// encrypt private key with AES-GCM derived from password
+// returns iv + ciphertext concatenated as base64
+async function encryptPrivateKey(
   privateKey: CryptoKey,
-  wrappingKey: CryptoKey
+  aesKey: CryptoKey
 ): Promise<ArrayBuffer> {
-  return crypto.subtle.wrapKey('pkcs8', privateKey, wrappingKey, 'AES-KW');
+  const exported = await crypto.subtle.exportKey('pkcs8', privateKey);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    aesKey,
+    cleanBuffer(exported)
+  );
+  // prepend iv to ciphertext
+  const result = new Uint8Array(12 + ciphertext.byteLength);
+  result.set(iv, 0);
+  result.set(new Uint8Array(ciphertext), 12);
+  return cleanBuffer(result);
 }
 
-// unwrap (decrypt) the RSA private key from AES-KW wrapping key
-export async function unwrapPrivateKey(
-  wrappedKeyBuf: ArrayBuffer,
-  wrappingKey: CryptoKey
+// decrypt private key with AES-GCM derived from password
+async function decryptPrivateKey(
+  encryptedBuf: ArrayBuffer,
+  aesKey: CryptoKey
 ): Promise<CryptoKey> {
-  // ensure we have a clean detached ArrayBuffer
-  const clean = wrappedKeyBuf.slice(0);
-  return crypto.subtle.unwrapKey(
+  const data = new Uint8Array(encryptedBuf);
+  const iv = data.slice(0, 12);
+  const ciphertext = data.slice(12);
+  const pkcs8 = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: cleanBuffer(iv) },
+    aesKey,
+    cleanBuffer(ciphertext)
+  );
+  return crypto.subtle.importKey(
     'pkcs8',
-    clean,
-    wrappingKey,
-    'AES-KW',
+    cleanBuffer(pkcs8),
     { name: 'RSA-OAEP', hash: RSA_HASH },
     false,
     ['decrypt']
   );
 }
 
-// export RSA public key as base64 SPKI
-export async function exportPublicKey(publicKey: CryptoKey): Promise<string> {
-  const exported = await crypto.subtle.exportKey('spki', publicKey);
-  return bufToB64(exported);
-}
-
-// import RSA public key from base64 SPKI
-export async function importPublicKey(b64: string): Promise<CryptoKey> {
-  const buf = b64ToBuf(b64);
-  return crypto.subtle.importKey(
-    'spki',
-    buf,
-    { name: 'RSA-OAEP', hash: RSA_HASH },
-    false,
-    ['encrypt']
-  );
-}
-
-// generate a random AES-GCM key for message encryption
 export async function generateMessageKey(): Promise<CryptoKey> {
   return crypto.subtle.generateKey(
     { name: 'AES-GCM', length: AES_GCM_LENGTH },
-    true, // must be extractable to wrap with RSA
+    true,
     ['encrypt', 'decrypt']
   );
 }
 
-// encrypt plaintext with AES-GCM, returns ciphertext + iv both as base64
 export async function encryptMessage(
   plaintext: string,
   aesKey: CryptoKey
@@ -142,11 +149,10 @@ export async function encryptMessage(
   );
   return {
     ciphertext: bufToB64(ciphertextBuf),
-    iv: bufToB64(iv.buffer),
+    iv: bufToB64(cleanBuffer(iv)),
   };
 }
 
-// decrypt AES-GCM ciphertext, returns plaintext string
 export async function decryptMessage(
   ciphertextB64: string,
   ivB64: string,
@@ -161,7 +167,6 @@ export async function decryptMessage(
   return dec.decode(plaintextBuf);
 }
 
-// encrypt the AES key with an RSA-OAEP public key
 export async function encryptAESKey(
   aesKey: CryptoKey,
   recipientPublicKey: CryptoKey
@@ -170,12 +175,11 @@ export async function encryptAESKey(
   const encryptedBuf = await crypto.subtle.encrypt(
     { name: 'RSA-OAEP' },
     recipientPublicKey,
-    exportedAES
+    cleanBuffer(exportedAES)
   );
   return bufToB64(encryptedBuf);
 }
 
-// decrypt the AES key with our RSA-OAEP private key
 export async function decryptAESKey(
   encryptedKeyB64: string,
   privateKey: CryptoKey
@@ -187,15 +191,13 @@ export async function decryptAESKey(
   );
   return crypto.subtle.importKey(
     'raw',
-    decryptedBuf,
+    cleanBuffer(decryptedBuf),
     { name: 'AES-GCM', length: AES_GCM_LENGTH },
     false,
     ['decrypt']
   );
 }
 
-// full message encryption flow:
-// returns the complete EncryptedPayload ready to send to the API
 export async function encryptForRecipient(
   plaintext: string,
   recipientPublicKeyB64: string,
@@ -221,8 +223,6 @@ export async function encryptForRecipient(
   return { ciphertext, iv, encryptedKey, encryptedKeyForSelf };
 }
 
-// full message decryption flow:
-// uses encryptedKey if we are the recipient, encryptedKeyForSelf if we are the sender
 export async function decryptIncomingMessage(
   ciphertextB64: string,
   ivB64: string,
@@ -233,38 +233,38 @@ export async function decryptIncomingMessage(
   return decryptMessage(ciphertextB64, ivB64, aesKey);
 }
 
-// registration helper: generates keypair, derives wrapping key, wraps private key
-// returns everything needed for POST /auth/register
 export async function prepareRegistrationKeys(password: string): Promise<{
   publicKeyB64: string;
   wrappedPrivateKeyB64: string;
   saltB64: string;
 }> {
-  // generate clean detached salt buffer
+  // generate clean salt
   const saltBytes = new Uint8Array(16);
   crypto.getRandomValues(saltBytes);
-  const salt = new ArrayBuffer(16);
-  new Uint8Array(salt).set(saltBytes);
+  const salt = cleanBuffer(saltBytes);
 
   const keyPair = await generateKeyPair();
-  const wrappingKey = await deriveWrappingKey(password, salt);
-  const wrappedPrivateKey = await wrapPrivateKey(keyPair.privateKey, wrappingKey);
+
+  // derive AES-GCM key from password + salt
+  const aesKey = await deriveAESKey(password, salt);
+
+  // encrypt private key with AES-GCM (not AES-KW — avoids alignment issues)
+  const encryptedPrivateKey = await encryptPrivateKey(keyPair.privateKey, aesKey);
   const publicKeyB64 = await exportPublicKey(keyPair.publicKey);
 
   return {
     publicKeyB64,
-    wrappedPrivateKeyB64: bufToB64(wrappedPrivateKey),
+    wrappedPrivateKeyB64: bufToB64(encryptedPrivateKey),
     saltB64: bufToB64(salt),
   };
 }
 
-// login helper: re-derives wrapping key from password + stored salt, unwraps private key
 export async function restorePrivateKey(
   password: string,
   wrappedPrivateKeyB64: string,
   saltB64: string
 ): Promise<CryptoKey> {
   const salt = b64ToBuf(saltB64);
-  const wrappingKey = await deriveWrappingKey(password, salt);
-  return unwrapPrivateKey(b64ToBuf(wrappedPrivateKeyB64), wrappingKey);
+  const aesKey = await deriveAESKey(password, salt);
+  return decryptPrivateKey(b64ToBuf(wrappedPrivateKeyB64), aesKey);
 }
